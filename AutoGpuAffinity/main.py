@@ -19,6 +19,39 @@ import psutil
 import wmi
 from config import Api, Config
 
+from ctypes import wintypes
+
+DIGCF_PRESENT = 0x00000002
+DIGCF_ALLCLASSES = 0x00000004
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+setupapi = ctypes.WinDLL("setupapi")
+cfgmgr32 = ctypes.WinDLL("cfgmgr32")
+
+class SP_DEVINFO_DATA(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("ClassGuid", ctypes.c_byte * 16),
+        ("DevInst", wintypes.DWORD),
+        ("Reserved", ctypes.POINTER(ctypes.c_ulong))
+    ]
+
+SetupDiGetClassDevsW = setupapi.SetupDiGetClassDevsW
+SetupDiGetClassDevsW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, wintypes.HWND, wintypes.DWORD]
+SetupDiGetClassDevsW.restype = ctypes.c_void_p
+
+SetupDiOpenDeviceInfoW = setupapi.SetupDiOpenDeviceInfoW
+SetupDiOpenDeviceInfoW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, wintypes.HWND, wintypes.DWORD, ctypes.POINTER(SP_DEVINFO_DATA)]
+SetupDiOpenDeviceInfoW.restype = wintypes.BOOL
+
+CM_Get_Parent = cfgmgr32.CM_Get_Parent
+CM_Get_Parent.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD, wintypes.ULONG]
+CM_Get_Parent.restype = wintypes.ULONG
+
+CM_Get_Device_IDW = cfgmgr32.CM_Get_Device_IDW
+CM_Get_Device_IDW.argtypes = [wintypes.DWORD, wintypes.LPWSTR, wintypes.ULONG, wintypes.ULONG]
+CM_Get_Device_IDW.restype = wintypes.ULONG
+
 LOG_CLI = logging.getLogger("CLI")
 
 
@@ -27,9 +60,29 @@ def start_afterburner(path: str, profile: int) -> None:
         time.sleep(5)
         process.kill()
 
+def get_parent_device(instance_id):
+    devinfo = SetupDiGetClassDevsW(None, None, None, DIGCF_PRESENT | DIGCF_ALLCLASSES)
+    if devinfo == INVALID_HANDLE_VALUE:
+        return None
+
+    devdata = SP_DEVINFO_DATA()
+    devdata.cbSize = ctypes.sizeof(SP_DEVINFO_DATA)
+
+    if not SetupDiOpenDeviceInfoW(devinfo, instance_id, None, 0, ctypes.byref(devdata)):
+        return None
+
+    parent = wintypes.DWORD()
+    if CM_Get_Parent(ctypes.byref(parent), devdata.DevInst, 0) != 0:
+        return None
+
+    buffer = ctypes.create_unicode_buffer(200)
+    if CM_Get_Device_IDW(parent.value, buffer, 200, 0) != 0:
+        return None
+
+    return buffer.value
 
 def apply_affinity(hwids: list[str], cpu: int = -1, apply: bool = True) -> None:
-    for hwid in hwids:
+    def set_affinity(hwid: str):
         policy_path = f"SYSTEM\\ControlSet001\\Enum\\{hwid}\\Device Parameters\\Interrupt Management\\Affinity Policy"
 
         if apply and cpu > -1:
@@ -39,14 +92,7 @@ def apply_affinity(hwids: list[str], cpu: int = -1, apply: bool = True) -> None:
 
             with winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, policy_path) as key:
                 winreg.SetValueEx(key, "DevicePolicy", 0, winreg.REG_DWORD, 4)
-                winreg.SetValueEx(
-                    key,
-                    "AssignmentSetOverride",
-                    0,
-                    winreg.REG_BINARY,
-                    le_hex,
-                )
-
+                winreg.SetValueEx(key, "AssignmentSetOverride", 0, winreg.REG_BINARY, le_hex)
         else:
             try:
                 with winreg.OpenKey(
@@ -58,7 +104,13 @@ def apply_affinity(hwids: list[str], cpu: int = -1, apply: bool = True) -> None:
                     winreg.DeleteValue(key, "DevicePolicy")
                     winreg.DeleteValue(key, "AssignmentSetOverride")
             except FileNotFoundError:
-                LOG_CLI.debug("affinity policy has already been removed for %s", hwid)
+                pass
+
+    for hwid in hwids:
+        set_affinity(hwid)
+        parent = get_parent_device(hwid)
+        if parent:
+            set_affinity(parent)
 
     subprocess.run(
         ["bin\\restart64\\restart64.exe", "/q"],
@@ -191,8 +243,39 @@ def display_results(csv_directory: str, enable_color: bool) -> None:
 
     os.system("<nul set /p=\x1b[8;50;1000t")
 
+    # compute a weighted score for each core
+    core_scores: dict[str, float] = {}
+
+    for cpu, metrics in results.items():
+        score = (
+            metrics["percentile1"] * 0.05 +
+            metrics["percentile0.1"] * 0.05 +
+            metrics["percentile0.01"] * 0.05 +
+            metrics["percentile0.005"] * 0.05 +
+            metrics["lows1"] * 0.2 +
+            metrics["lows0.1"] * 0.2 +
+            metrics["lows0.01"] * 0.2 +
+            metrics["lows0.005"] * 0.2 +
+            abs(metrics["stdev"]) * -0.2 +
+            metrics["maximum"] * 0.05 +
+            metrics["average"] * 0.1 +
+            metrics["minimum"] * 0.15
+        )
+        core_scores[cpu] = round(score, 4)
+
     print_table(formatted_results)
 
+    # print all scores
+    # sorted_scores = sorted(core_scores.items(), key=lambda x: x[1], reverse=True)
+    # for cpu, score in sorted_scores:
+    #     print(f"CPU-{cpu}: {score:.4f}")
+    
+    # print the two best cpus
+    sorted_scores = sorted(core_scores.items(), key=lambda x: x[1], reverse=True)
+    best_cpu = sorted_scores[0][0]
+    second_best_cpu = sorted_scores[1][0]
+    print(f"First: {best_cpu}")
+    print(f"Second: {second_best_cpu}")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
